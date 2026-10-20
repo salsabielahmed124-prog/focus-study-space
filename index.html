@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Online Classroom</title>
+<style>
+:root{--c:#2f6f5e}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,sans-serif;background:#f6f7f5;color:#1c2321}
+.w{max-width:760px;margin:0 auto;padding:16px}
+.card{background:#fff;border-radius:12px;padding:14px;margin:10px 0;box-shadow:0 1px 3px #0002}
+input,select,textarea{font:inherit;padding:10px;border-radius:8px;border:1px solid #ccc;width:100%;margin:4px 0}
+button{font:inherit;background:var(--c);color:#fff;border:0;border-radius:8px;padding:10px 14px;cursor:pointer;margin:3px 2px}
+button.g{background:#e4e8e6;color:#1c2321}
+.tabs{display:flex;flex-wrap:wrap}
+.row{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+.err{color:#b00020}
+small{color:#777}
+.msg b{color:var(--c)}
+#msgs{max-height:55vh;overflow:auto}
+.bar{display:flex;gap:6px;align-items:center}
+.bar input[type=text]{flex:1}
+audio{width:100%}
+</style>
+</head>
+<body>
+<div class="w"><div id="app"></div></div>
+
+<script type="module">
+import {initializeApp} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import {getAuth,GoogleAuthProvider,signInWithPopup,signOut,onAuthStateChanged} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import {getFirestore,collection,doc,getDoc,getDocs,setDoc,addDoc,updateDoc,deleteDoc,arrayUnion,arrayRemove,query,orderBy,onSnapshot,serverTimestamp} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+/* ====== PASTE YOUR FIREBASE CONFIG ====== */
+const firebaseConfig = {
+  apiKey: "PASTE_HERE",
+  authDomain: "PASTE_HERE",
+  projectId: "PASTE_HERE",
+  appId: "PASTE_HERE"
+};
+/* (Teacher/supervisor passwords are in firestore.rules, not here) */
+
+const fb = initializeApp(firebaseConfig), auth = getAuth(fb), db = getFirestore(fb);
+const $ = s => document.querySelector(s), app = $('#app');
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = t => t?.toDate ? t.toDate().toLocaleString() : '';
+const safeUrl = u => /^https?:\/\//i.test(u) ? u : '';
+const sid = n => n.trim().toLowerCase().replace(/\s+/g, ' ').replace(/\//g, '-');
+const okData = d => /^data:[\w\/+.;=-]+;base64,[A-Za-z0-9+\/=]+$/.test(d || '');
+const MAX = 600000;
+let U, ME, unsubs = [], SID, tab = 'lessons', items = [], msgs = [], rec;
+const clear = () => { unsubs.forEach(u => u()); unsubs = []; };
+
+onAuthStateChanged(auth, async u => {
+  clear(); U = u;
+  if (!u) return signinView();
+  const d = await getDoc(doc(db, 'users', u.uid));
+  if (d.exists()) { ME = d.data(); home(); } else setupView();
+});
+
+/* ---------- SIGN IN / SETUP ---------- */
+function signinView() {
+  app.innerHTML = `<div class="card"><h2>Online Classroom</h2><button id="g">Sign in with Google</button><p id="err" class="err"></p></div>`;
+  $('#g').onclick = () => signInWithPopup(auth, new GoogleAuthProvider()).catch(e => $('#err').textContent = e.message);
+}
+function setupView() {
+  app.innerHTML = `<div class="card"><h3>Welcome</h3><small>${esc(U.email)}</small>
+  <input id="n" placeholder="Your name">
+  <select id="r"><option value="student">Student</option><option value="supervisor">Supervisor</option><option value="teacher">Teacher</option></select>
+  <input id="p" type="password" placeholder="Password" style="display:none">
+  <button id="ok">Continue</button><button class="g" id="lo">Cancel</button><p id="err" class="err"></p></div>`;
+  $('#r').onchange = () => $('#p').style.display = $('#r').value === 'student' ? 'none' : 'block';
+  $('#lo').onclick = () => signOut(auth);
+  $('#ok').onclick = async () => {
+    const name = $('#n').value.trim(), role = $('#r').value;
+    if (!name) return $('#err').textContent = 'Enter your name';
+    const d = {name, email: U.email, role, favs: [], ts: serverTimestamp()};
+    if (role !== 'student') d.pw = $('#p').value;
+    try { await setDoc(doc(db, 'users', U.uid), d); ME = {name, email: U.email, role, favs: []}; home(); }
+    catch (e) { $('#err').textContent = role === 'student' ? e.message : 'Wrong password'; }
+  };
+}
+
+/* ---------- HOME ---------- */
+function home() {
+  clear(); SID = null;
+  app.innerHTML = `<div class="row"><div><h2>${esc(ME.name)}</h2><small>${ME.role} · ${esc(ME.email)}</small></div><button class="g" id="lo">Log out</button></div><div id="main"></div>`;
+  $('#lo').onclick = () => signOut(auth);
+  ME.role === 'teacher' ? teacherHome() : userHome();
+}
+
+async function teacherHome() {
+  $('#main').innerHTML = `<div class="card"><h3>New study space</h3>
+  <input id="sn" placeholder="Study space name"><input id="sp" placeholder="Password for this space">
+  <button id="cr">Create</button><p id="err" class="err"></p></div>
+  <h3>Study spaces</h3><div id="sl"></div><h3>Users</h3><div id="ul"></div>`;
+  $('#cr').onclick = async () => {
+    const n = $('#sn').value.trim(), p = $('#sp').value.trim();
+    if (!n || !p) return $('#err').textContent = 'Enter a name and a password';
+    const id = sid(n);
+    try {
+      if ((await getDoc(doc(db, 'spaces', id))).exists()) return $('#err').textContent = 'This name is already used';
+      await setDoc(doc(db, 'spacePrivate', id), {pass: p});
+      await setDoc(doc(db, 'spaces', id), {name: n, ts: serverTimestamp()});
+      teacherHome();
+    } catch (e) { $('#err').textContent = e.message; }
+  };
+  const [sp, pr, us] = await Promise.all([getDocs(collection(db, 'spaces')), getDocs(collection(db, 'spacePrivate')), getDocs(collection(db, 'users'))]);
+  const pw = {}; pr.forEach(d => pw[d.id] = d.data().pass);
+  $('#sl').innerHTML = sp.docs.map(d => `<div class="card row"><div><b>${esc(d.data().name)}</b><br><small>Password: ${esc(pw[d.id])}</small></div>
+    <div><button data-o="${esc(d.id)}">Open</button><button class="g" data-d="${esc(d.id)}">Delete</button></div></div>`).join('') || '<small>None yet</small>';
+  $('#ul').innerHTML = us.docs.filter(d => d.id !== U.uid).map(d => `<div class="card row"><div><b>${esc(d.data().name)}</b><br><small>${esc(d.data().role)} · ${esc(d.data().email)}</small></div>
+    <button class="g" data-u="${d.id}">Delete</button></div>`).join('') || '<small>No other users yet</small>';
+  document.querySelectorAll('[data-o]').forEach(b => b.onclick = () => openSpace(b.dataset.o));
+  document.querySelectorAll('[data-d]').forEach(b => b.onclick = async () => {
+    if (!confirm('Delete this study space?')) return;
+    await deleteDoc(doc(db, 'spaces', b.dataset.d)); await deleteDoc(doc(db, 'spacePrivate', b.dataset.d)); teacherHome();
+  });
+  document.querySelectorAll('[data-u]').forEach(b => b.onclick = async () => {
+    if (!confirm('Delete this user?')) return;
+    await deleteDoc(doc(db, 'users', b.dataset.u)); teacherHome();
+  });
+}
+
+async function userHome() {
+  $('#main').innerHTML = `<h3>Favorites</h3><div id="fv"></div>
+  <h3>Find a study space</h3><input id="q" placeholder="Exact study space name"><button id="fs">Search</button><div id="res"></div>`;
+  const card = (id, name) => {
+    const f = (ME.favs || []).includes(id);
+    return `<div class="card row"><b>${esc(name)}</b><div><button class="g" data-s="${esc(id)}">${f ? '★' : '☆'}</button><button data-o="${esc(id)}">Open</button></div></div>`;
+  };
+  const wire = box => {
+    box.querySelectorAll('[data-o]').forEach(b => b.onclick = () => enter(b.dataset.o));
+    box.querySelectorAll('[data-s]').forEach(b => b.onclick = async () => {
+      const id = b.dataset.s, f = (ME.favs || []).includes(id);
+      await updateDoc(doc(db, 'users', U.uid), {favs: f ? arrayRemove(id) : arrayUnion(id)});
+      ME.favs = f ? ME.favs.filter(x => x !== id) : [...(ME.favs || []), id]; userHome();
+    });
+  };
+  let html = '';
+  for (const id of ME.favs || []) {
+    try { const d = await getDoc(doc(db, 'spaces', id)); if (d.exists()) html += card(id, d.data().name); } catch (e) {}
+  }
+  $('#fv').innerHTML = html || '<small>No favorites yet</small>'; wire($('#fv'));
+  $('#fs').onclick = async () => {
+    const q = $('#q').value; if (!q.trim()) return;
+    try {
+      const id = sid(q), d = await getDoc(doc(db, 'spaces', id));
+      $('#res').innerHTML = d.exists() ? card(id, d.data().name) : '<p class="err">No study space with this name</p>';
+      wire($('#res'));
+    } catch (e) { $('#res').innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+  };
+}
+async function enter(id) {
+  try {
+    const m = await getDoc(doc(db, 'spaces', id, 'members', U.uid));
+    if (!m.exists()) {
+      const p = prompt('Study space password'); if (p === null) return;
+      await setDoc(doc(db, 'spaces', id, 'members', U.uid), {pass: p, ts: serverTimestamp()});
+    }
+    openSpace(id);
+  } catch (e) { alert('Wrong password'); }
+}
+
+/* ---------- STUDY SPACE ---------- */
+async function openSpace(id) {
+  clear(); SID = id; tab = 'lessons'; items = []; msgs = [];
+  const d = await getDoc(doc(db, 'spaces', id));
+  if (!d.exists()) return home();
+  app.innerHTML = `<div class="row"><h2>${esc(d.data().name)}</h2><div><button class="g" id="bk">Back</button><button class="g" id="lo">Log out</button></div></div>
+  <div class="tabs">${['lessons', 'tests', 'materials', 'chat'].map(t => `<button data-t="${t}">${t[0].toUpperCase() + t.slice(1)}</button>`).join('')}</div><div id="body"></div>`;
+  $('#bk').onclick = home; $('#lo').onclick = () => signOut(auth);
+  document.querySelectorAll('[data-t]').forEach(b => b.onclick = () => { tab = b.dataset.t; body(); });
+  unsubs.push(onSnapshot(query(collection(db, 'spaces', id, 'items'), orderBy('ts')), s => { items = s.docs.map(x => x.data()); if (tab !== 'chat') body(); }));
+  unsubs.push(onSnapshot(query(collection(db, 'spaces', id, 'chat'), orderBy('ts')), s => { msgs = s.docs.map(x => x.data()); if (tab === 'chat') drawMsgs(); }));
+  body();
+}
+function body() {
+  document.querySelectorAll('[data-t]').forEach(b => b.style.opacity = b.dataset.t === tab ? 1 : .55);
+  if (tab === 'chat') {
+    $('#body').innerHTML = `<div id="msgs"></div><div class="bar"><input type="text" id="tx" placeholder="Message">
+    <label class="card" style="margin:0;padding:8px;cursor:pointer">📎<input id="fl" type="file" style="display:none"></label>
+    <button id="rc" class="g">🎤</button><button id="sd">Send</button></div>`;
+    $('#sd').onclick = () => { const t = $('#tx').value.trim(); if (t) { send({kind: 'text', text: t}); $('#tx').value = ''; } };
+    $('#tx').onkeydown = e => { if (e.key === 'Enter') $('#sd').click(); };
+    $('#fl').onchange = e => { const f = e.target.files[0]; if (f) toData(f, d => send({kind: 'file', data: d, mime: f.type, fname: f.name})); e.target.value = ''; };
+    $('#rc').onclick = toggleRec;
+    return drawMsgs();
+  }
+  const form = ME.role === 'teacher' ? `<div class="card"><input id="ti" placeholder="Title"><input id="ur" placeholder="Link (https://...) — Drive, PDF, test link"><textarea id="nt" rows="2" placeholder="Notes (optional)"></textarea><button id="ad">Add</button></div>` : '';
+  $('#body').innerHTML = form + items.filter(i => i.kind === tab).map(i => `<div class="card"><b>${esc(i.title)}</b><br>
+    ${safeUrl(i.url) ? `<a href="${esc(safeUrl(i.url))}" target="_blank" rel="noopener">Open link</a>` : ''}
+    ${i.text ? `<div>${esc(i.text)}</div>` : ''}<small>${fmt(i.ts)}</small></div>`).join('') || '<p><small>Nothing here yet.</small></p>';
+  if ($('#ad')) $('#ad').onclick = async () => {
+    const title = $('#ti').value.trim(); if (!title) return;
+    await addDoc(collection(db, 'spaces', SID, 'items'), {kind: tab, title, url: $('#ur').value.trim(), text: $('#nt').value.trim(), ts: serverTimestamp()});
+  };
+}
+function drawMsgs() {
+  const box = $('#msgs'); if (!box) return;
+  box.innerHTML = msgs.map(m => {
+    let x = '';
+    if (okData(m.data)) {
+      if (m.kind === 'audio') x = `<audio controls src="${m.data}"></audio>`;
+      else {
+        if (m.data.startsWith('data:image/')) x = `<img src="${m.data}" style="max-width:100%;border-radius:8px"><br>`;
+        x += `<a href="${m.data}" download="${esc(m.fname)}">⬇ ${esc(m.fname)}</a>`;
+      }
+    }
+    return `<div class="card msg"><b>${esc(m.name)}</b> <small>${esc(m.role)} · ${fmt(m.ts)}</small><div>${esc(m.text)}</div>${x}</div>`;
+  }).join('') || '<p><small>No messages yet.</small></p>';
+  box.scrollTop = box.scrollHeight;
+}
+const send = o => addDoc(collection(db, 'spaces', SID, 'chat'), {
+  name: ME.name, role: ME.role, uid: U.uid, text: '', kind: 'text', fname: '', mime: '', data: '', ...o, ts: serverTimestamp()
+}).catch(e => alert('Could not send: ' + e.message));
+function toData(blob, cb) {
+  if (blob.size > MAX) return alert('File too large (max ~600 KB)');
+  const r = new FileReader(); r.onload = () => cb(r.result); r.readAsDataURL(blob);
+}
+async function toggleRec() {
+  const b = $('#rc');
+  if (rec) { rec.stop(); return; }
+  try {
+    const st = await navigator.mediaDevices.getUserMedia({audio: true}), ch = []; let tm;
+    rec = new MediaRecorder(st, {audioBitsPerSecond: 16000});
+    rec.ondataavailable = e => ch.push(e.data);
+    rec.onstop = () => {
+      st.getTracks().forEach(t => t.stop()); clearTimeout(tm);
+      const bl = new Blob(ch, {type: rec.mimeType}); rec = null; b.textContent = '🎤';
+      toData(bl, d => send({kind: 'audio', data: d, mime: bl.type, fname: 'voice'}));
+    };
+    rec.start(); b.textContent = '⏹'; tm = setTimeout(() => rec && rec.stop(), 60000);
+  } catch (e) { alert('Microphone not available'); }
+}
+</script>
+</body>
+</html>
